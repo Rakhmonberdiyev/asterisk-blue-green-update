@@ -1,0 +1,114 @@
+services:
+  asterisk:
+    image: asterisk-native:latest
+    container_name: asterisk-native
+    command: ["/entrypoint.sh"]
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "10000-10100:10000-10100/udp"
+    volumes:
+      # Blue-green dialplan'ni host'dan mount qilamiz, shunda 1003 ext
+      # AstDB orqali app tanlaydi va o'zgarish konteyner recreate'da yo'qolmaydi.
+      - ./blue-green/extensions.live.conf:/etc/asterisk/extensions.conf:ro
+    restart: unless-stopped
+
+  ari-gateway:
+    build:
+      context: ./call_center_latest
+    image: ari-gateway-latest:latest
+    command:
+      [
+        "python", "ari_gateway.py",
+        "-a",  "ai-callcenter",
+        "-aU", "ai-user",
+        "-aP", "your_password",
+        "-ah", "asterisk",
+        "-ap", "8088",
+        "-w",  "http://nginx-workers"
+      ]
+    env_file:
+      - ./call_center_latest/.env
+    environment:
+      ARI_HOST: "asterisk"
+      ARI_PORT: "8088"
+      ARI_APP: "ai-callcenter"
+      ARI_USER: "ai-user"
+      ARI_PASSWORD: "your_password"
+      WORKER_BALANCER_URL: "http://nginx-workers"
+      INIT_MCP: "0"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    depends_on:
+      - asterisk
+      - nginx-workers
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  nginx-workers:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      ai-worker:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ai-worker:
+    build:
+      context: ./call_center_latest
+    image: ai-worker-latest:latest
+    command:
+      [
+        "sh", "-lc",
+        "until python db/create_table.py; do echo 'waiting for postgres...'; sleep 2; done && python worker_server.py --host 0.0.0.0 --port 8766 --max-sessions ${WORKER_MAX_SESSIONS:-2}"
+      ]
+    env_file:
+      - ./call_center_latest/.env
+    environment:
+      ARI_HOST: "asterisk"
+      ARI_PORT: "8088"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      INIT_MCP: "1"
+      WORKER_PORT: "8766"
+      WORKER_MAX_SESSIONS: "${WORKER_MAX_SESSIONS:-2}"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8766/health', timeout=2).read()\""
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      - asterisk
+      - postgres
+      - redis
+    deploy:
+      replicas: 5
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: call_center
+      POSTGRES_USER: call_center
+      POSTGRES_PASSWORD: call_center_pass
+    volumes:
+      - call-center-postgres-latest:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+volumes:
+  call-center-postgres-latest:

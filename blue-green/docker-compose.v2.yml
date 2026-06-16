@@ -1,0 +1,110 @@
+# =====================================================================
+#  v2 (GREEN) parallel stack
+# =====================================================================
+#  Bu fayl asosiy docker-compose.yml bilan BIRGA, bitta proyektda ishga
+#  tushiriladi. Shuning uchun v2 servislari asosiy stack'dagi shared
+#  servislarga (asterisk, postgres, redis) bemalol ulanadi.
+#
+#  Ishga tushirish:
+#    docker compose -f docker-compose.yml -f blue-green/docker-compose.v2.yml \
+#        up -d ari-gateway-v2 nginx-workers-v2 ai-worker-v2
+#
+#  Nega alohida nom?  v1 hali ishlab turibdi. Service nomlari boshqacha
+#  bo'lgani uchun ikkala versiya yonma-yon yashaydi. Cutoverdan keyin
+#  v1 drain bo'lib o'chiriladi.
+# =====================================================================
+services:
+  # ---- v2 ARI gateway -------------------------------------------------
+  # MUHIM: boshqa Stasis app nomi (ai-callcenter-v2).
+  # Agar v1 bilan bir xil app nomi bo'lsa, Asterisk har call event'ni
+  # IKKALA gateway'ga ham yuboradi -> double handling. Shuning uchun -a
+  # qiymati va ARI_APP boshqacha.
+  ari-gateway-v2:
+    build:
+      context: /call_center_latest
+    image: ari-gateway:v2
+    container_name: ari-gateway-v2
+    command:
+      [
+        "python", "ari_gateway.py",
+        "-a",  "ai-callcenter-v2",
+        "-aU", "ai-user",
+        "-aP", "your_password",
+        "-ah", "asterisk",
+        "-ap", "8088",
+        "-w",  "http://nginx-workers-v2"
+      ]
+    env_file:
+      - /call_center_latest/.env
+    environment:
+      ARI_HOST: "asterisk"
+      ARI_PORT: "8088"
+      ARI_APP: "ai-callcenter-v2"
+      ARI_USER: "ai-user"
+      ARI_PASSWORD: "your_password"
+      WORKER_BALANCER_URL: "http://nginx-workers-v2"
+      INIT_MCP: "0"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    depends_on:
+      - asterisk
+      - nginx-workers-v2
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  # ---- v2 worker balancer --------------------------------------------
+  # v2 gateway faqat shu nginx'ga sessiya yuboradi, u esa faqat
+  # ai-worker-v2 replica'lariga yo'naltiradi. v1 va v2 trafigi
+  # to'liq ajralgan.
+  nginx-workers-v2:
+    image: nginx:1.27-alpine
+    container_name: nginx-workers-v2
+    volumes:
+      - ./blue-green/nginx.v2.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      ai-worker-v2:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- v2 call-handling workers --------------------------------------
+  ai-worker-v2:
+    build:
+      context: /call_center_latest
+    image: ai-worker:v2
+    command:
+      [
+        "sh", "-lc",
+        "until python db/create_table.py; do echo 'waiting for postgres...'; sleep 2; done && python worker_server.py --host 0.0.0.0 --port 8766 --max-sessions ${WORKER_MAX_SESSIONS:-2}"
+      ]
+    env_file:
+      - /call_center_latest/.env
+    environment:
+      ARI_HOST: "asterisk"
+      ARI_PORT: "8088"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      INIT_MCP: "1"
+      WORKER_PORT: "8766"
+      WORKER_MAX_SESSIONS: "${WORKER_MAX_SESSIONS:-2}"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8766/health', timeout=2).read()\""
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      - asterisk
+      - postgres
+      - redis
+    deploy:
+      replicas: 5
+    restart: unless-stopped

@@ -1,0 +1,34 @@
+; =====================================================================
+;  BLUE-GREEN uchun moslangan dialplan (BIR MARTALIK o'zgarish)
+; =====================================================================
+;  Farqi: Stasis app nomi endi qattiq yozilmagan, AstDB'dan o'qiladi.
+;  Cutover faqat bitta buyruq bilan bo'ladi (fayl tahrirlamasdan,
+;  dialplan reload'siz):
+;
+;     asterisk -rx "database put bluegreen stasis_app ai-callcenter-v2"   ; -> v2
+;     asterisk -rx "database put bluegreen stasis_app ai-callcenter"      ; -> v1 (rollback)
+;
+;  AstDB bo'sh bo'lsa, default 'ai-callcenter' (v1/blue) ishlatiladi.
+;  Bu o'zgarish FAQAT yangi call'larga ta'sir qiladi — Stasis() qatorini
+;  o'tib bo'lgan call'lar o'z gateway'ida tugaydi.
+; =====================================================================
+[from-trunk]
+exten => 555202044,1,Progress()
+ same => n,Set(SESSION_ID=${PJSIP_HEADER(read,X-Live-Session-ID)})
+ same => n,Set(RPI=${PJSIP_HEADER(read,Remote-Party-ID)})
+ same => n,Set(CALLER_NUM=${FILTER(0-9,${CUT(RPI,@,1)})})
+ same => n,Set(UUID=${SHELL(uuidgen | tr -d '\n')})
+ same => n,MixMonitor(${CALLER_NUM}-${SESSION_ID}.wav)
+ same => n,NoOp(Session ID: ${SESSION_ID} | UUID: ${UUID} | Caller: ${CALLER_NUM})
+ same => n,Set(CDR(session_id)=${SESSION_ID})
+ same => n,Playtones(ring)
+ same => n,Wait(3)
+ same => n,StopPlaytones()
+ same => n,Answer()
+ same => n,Playback(intro_8k)
+ ; ---- Blue-green app tanlash (AstDB) ----
+ same => n,Set(STASIS_APP=${DB(bluegreen/stasis_app)})
+ same => n,ExecIf($["${STASIS_APP}"=""]?Set(STASIS_APP=ai-callcenter))
+ same => n,NoOp(Routing call to Stasis app: ${STASIS_APP})
+ same => n,Stasis(${STASIS_APP}, incoming)
+ same => n,Hangup()

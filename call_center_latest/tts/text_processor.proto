@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package textprocessor;
+
+// Xizmatni belgilash
+service TextProcessingService {
+  // Ikki tomonlama stream: Tokenlar kiradi, Process qilingan matn chiqadi
+  rpc ProcessStream (stream TextRequest) returns (stream TextResponse);
+}
+
+message TextRequest {
+  string token = 1; // LLMdan kelayotgan har bir token (yoki so'z)
+}
+
+message TextResponse {
+  string processed_text = 1; // TTSga yuboriladigan tayyor matn bo'lagi
+}
