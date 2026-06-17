@@ -80,6 +80,7 @@ class VoiceActivityDetector:
 
         confidence = self.model(torch.from_numpy(audio_float32), SAMPLE_RATE).item()  # BUG 1 fix
 
+        print(f"[VAD] confidence={confidence:.3f} threshold={self.threshold}", flush=True)
         return confidence > self.threshold
 
 

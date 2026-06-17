@@ -1,3 +1,4 @@
+import asyncio
 import requests, os
 import boto3
 from botocore.client import Config
@@ -14,23 +15,25 @@ s3 = boto3.client(
                 endpoint_url=os.getenv("S3_STORAGE_URL","http://172.28.23.101:3900"),
                     aws_access_key_id=os.getenv("S3_KEY_ID", "GK6d3c9bdaf79f8317c69119bf"),
                         aws_secret_access_key=os.getenv("S3_KEY", "9ee9b03bca7d76ae5bf2945180558d72c2be0231ede5f050fcc73ae97111030a"),
-                            config=Config(signature_version="s3v4"),
+                            config=Config(signature_version="s3v4", connect_timeout=5, read_timeout=5),
                                 region_name=os.getenv("S3_GARAGE", "garage"),
                                 )
 
 
 async def put_object(key, body):
-    r = s3.put_object(Bucket=BUCKET, Key=key, Body=body)
-    status_code = r["ResponseMetadata"]["HTTPStatusCode"]
-    print(f"{key} put to s3. Status: {status_code}")
-    if status_code == 200:
-        return True
-    else:
+    try:
+        r = await asyncio.to_thread(s3.put_object, Bucket=BUCKET, Key=key, Body=body)
+        status_code = r["ResponseMetadata"]["HTTPStatusCode"]
+        print(f"{key} put to s3. Status: {status_code}")
+        return status_code == 200
+    except Exception as e:
+        print(f"S3 put_object failed for {key}: {e}")
         return False
 
 
 async def get_object(key):
-    data = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+    obj = await asyncio.to_thread(s3.get_object, Bucket=BUCKET, Key=key)
+    data = await asyncio.to_thread(obj["Body"].read)
     print(f"Downloaded: {data[:20]}... ")
     return data
 
