@@ -1,88 +1,56 @@
 import asyncio
-import io, os
-import time
-import grpc
-import numpy as np
-import tts.text_processor_pb2 as text_processor_pb2, tts.text_processor_pb2_grpc as text_processor_pb2_grpc
-
-import soundfile as sf
-import tritonclient.grpc as grpcclient
+import audioop
+import io
+import os
+import wave
+import httpx
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-TTS_TRITON_URL = os.getenv("TTS_TRITON", "172.28.23.100:1001")
-TTS_AUDIO_SAMPLE_RATE = 44100
-TEXT_PROCESSOR_URL = os.getenv("TTS_TRITON", "172.28.23.100:1001")
+TTS_API = os.getenv("TTS_API")
+ACCESS_TOKEN = os.getenv("XAZNA_TTS_ACCESS_TOKEN")
+
+# Asterisk's external media channel is slin16 (16-bit PCM @ 16kHz), but the
+# TTS API returns audio at its own native rate (e.g. 44.1kHz) — resample so
+# downstream playback code's 16kHz assumption holds.
+PLAYBACK_SAMPLE_RATE = 16000
 
 
-# --- Triton klienti modul darajasida BIR MARTA yaratiladi ---
-# tritonclient.grpc klienti thread-safe, shuning uchun uni
-# bir nechta to_thread chaqiruvidan parallel ishlatish xavfsiz.
-_triton_client = grpcclient.InferenceServerClient(url=TTS_TRITON_URL, verbose=False)
+def _resample_wav_to_16k(wav_bytes: bytes) -> bytes:
+    with wave.open(io.BytesIO(wav_bytes), 'rb') as src:
+        channels = src.getnchannels()
+        sample_rate = src.getframerate()
+        sampwidth = src.getsampwidth()
+        frames = src.readframes(src.getnframes())
+
+    if channels != 1:
+        frames = audioop.tomono(frames, sampwidth, 0.5, 0.5)
+
+    if sample_rate != PLAYBACK_SAMPLE_RATE:
+        frames, _ = audioop.ratecv(frames, sampwidth, 1, sample_rate, PLAYBACK_SAMPLE_RATE, None)
+
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as dst:
+        dst.setnchannels(1)
+        dst.setsampwidth(sampwidth)
+        dst.setframerate(PLAYBACK_SAMPLE_RATE)
+        dst.writeframes(frames)
+    return buf.getvalue()
 
 
-def split_text(text: str):
-    def token_generator(text):
-        yield text_processor_pb2.TextRequest(token=text)
-
-    with grpc.insecure_channel(TEXT_PROCESSOR_URL) as channel:
-        stub = text_processor_pb2_grpc.TextProcessingServiceStub(channel)
-        responses = stub.ProcessStream(token_generator(text))
-        for response in responses:
-            chunk = response.processed_text.strip()
-            if chunk:
-                yield chunk
-
-
-def infer_tts(text: str, emotion: str = "happy", sample_rate: int = 16000):
-    """Bloklovchi Triton chaqiruvi. Faqat alohida threadda chaqirilishi kerak."""
-    # 1. Target text input
-    text_data = np.array([[text.encode('utf-8')]], dtype=object)
-    inputs = [grpcclient.InferInput("target_text", [1, 1], "BYTES")]
-    inputs[0].set_data_from_numpy(text_data)
-
-    # 2. Emotion input
-    emotion_data = np.array([[emotion.encode('utf-8')]], dtype=object)
-    emotion_input = grpcclient.InferInput("emotion", [1, 1], "BYTES")
-    emotion_input.set_data_from_numpy(emotion_data)
-    inputs.append(emotion_input)
-
-    # 3. Sample rate input
-    sample_rate_data = np.array([[sample_rate]], dtype=np.int32)
-    sample_rate_input = grpcclient.InferInput("sample_rate", [1, 1], "INT32")
-    sample_rate_input.set_data_from_numpy(sample_rate_data)
-    inputs.append(sample_rate_input)
-
-    outputs = [grpcclient.InferRequestedOutput("waveform")]
-
-    response = _triton_client.infer(
-        model_name="f5_tts",
-        inputs=inputs,
-        outputs=outputs,
-    )
-
-    return response.as_numpy("waveform")[0]
-
-
-def _sync_synthesize(text: str) -> bytes:
-    """Bloklovchi qism — infer_tts + sf.write. Alohida threadda ishlaydi."""
-    audio = infer_tts(text=text)
-    buffer = io.BytesIO()
-    sf.write(buffer, audio, 16000, format="WAV", subtype="PCM_16")
-    return buffer.getvalue()
-
-
-i = 0
-
-
-async def synthesize_tts(text):
-    """Async wrapper: bloklovchi TTS ishini threadga chiqaradi,
-    shunda event loop bloklanmaydi."""
-    global i
-    i += 1
-    return await asyncio.to_thread(_sync_synthesize, text)
+async def synthesize_tts(text: str, emotion: str = "Neural", format: str = "wav") -> bytes:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            TTS_API,
+            headers={"X-Access-Token": ACCESS_TOKEN, "Content-Type": "application/json"},
+            json={"text": text, "mdl": "Base", "format": format, "emotion": emotion},
+        )
+        resp.raise_for_status()
+        if format == "wav":
+            return _resample_wav_to_16k(resp.content)
+        return resp.content
 
 
 async def main():
