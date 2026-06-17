@@ -1,8 +1,7 @@
 services:
   asterisk:
-    image: asterisk-native:latest
+    image: asterisk-arm64:latest
     container_name: asterisk-native
-    command: ["/entrypoint.sh"]
     ports:
       - "5060:5060/udp"
       - "5060:5060/tcp"
@@ -11,6 +10,7 @@ services:
       # Blue-green dialplan'ni host'dan mount qilamiz, shunda 1003 ext
       # AstDB orqali app tanlaydi va o'zgarish konteyner recreate'da yo'qolmaydi.
       - ./blue-green/extensions.live.conf:/etc/asterisk/extensions.conf:ro
+      - ./blue-green/pjsip.live.conf:/etc/asterisk/pjsip.conf:ro
     restart: unless-stopped
 
   ari-gateway:
