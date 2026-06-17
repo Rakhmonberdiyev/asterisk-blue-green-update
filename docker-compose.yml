@@ -11,6 +11,7 @@ services:
       # AstDB orqali app tanlaydi va o'zgarish konteyner recreate'da yo'qolmaydi.
       - ./blue-green/extensions.live.conf:/etc/asterisk/extensions.conf:ro
       - ./blue-green/pjsip.live.conf:/etc/asterisk/pjsip.conf:ro
+      - ./call_recordings:/var/spool/asterisk/monitor
     restart: unless-stopped
 
   ari-gateway:
