@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import wave
 import traceback
 from datetime import datetime
@@ -12,13 +13,8 @@ import time
 
 # DB va Custom modullar
 from db.queries import create_session, get_or_create_user, update_session_recordings, create_conversation
-import grpc
-import grpc.aio
 from handover import trigger_handover, r
-import vad.vad_pb2 as vad_pb2
-import vad.vad_pb2_grpc as vad_pb2_grpc
-import tts.text_processor_pb2 as text_processor_pb2
-import tts.text_processor_pb2_grpc as text_processor_pb2_grpc
+from vad.rn_client import VoiceActivityDetector
 
 from llm.llm_social_payment import message_streaming
 from stt.stt_client import transcribe_audio
@@ -30,8 +26,7 @@ from s3_storage import storage
 
 load_dotenv()
 
-VAD_URL = os.getenv("VAD_GRPC_BASE_URL")
-TEXT_PROCESSOR_URL = os.getenv("TTS_TRITON")
+SENTENCE_END_RE = re.compile(r'[^.!?]*[.!?]+')
 
 # --- VAD sezgirligi (env orqali, rebuild qilmasdan sozlash mumkin) ---
 # VAD_THRESHOLD: har bir audio bo'lakni "ovoz" deb hisoblash chegarasi.
@@ -117,29 +112,33 @@ async def process_segment(audio_bytes, conversation, tts_queue, resume_callback,
 
         ai_audio_chunks = []
         full_ai_text = []
+        text_buffer = ""
 
-        async with grpc.aio.insecure_channel(TEXT_PROCESSOR_URL) as channel:
-            stub = text_processor_pb2_grpc.TextProcessingServiceStub(channel)
+        async def speak(txt):
+            txt = txt.strip()
+            if not txt:
+                return
+            print(txt)
+            audio = await synthesize_tts(txt)
+            full_ai_text.append(txt)
+            raw_pcm = audio[44:] if len(audio) > 44 else audio
+            ai_audio_chunks.append(raw_pcm)
+            await tts_queue.put(audio)
 
-            async def gen():
-                async for tok in message_streaming(conversation, "uz", websocket, session_id, db_session_id):
-                    yield text_processor_pb2.TextRequest(token=tok)
+        async for tok in message_streaming(conversation, "uz", websocket, session_id, db_session_id):
+            if tts_queue is None:
+                break
+            text_buffer += tok
 
-            async for resp in stub.ProcessStream(gen()):
-                if tts_queue is None:
+            while True:
+                match = SENTENCE_END_RE.search(text_buffer)
+                if not match:
                     break
-                txt = resp.processed_text.strip()
-                if not txt:
-                    continue
+                await speak(match.group())
+                text_buffer = text_buffer[match.end():]
 
-                print(txt)
-
-                audio = await synthesize_tts(txt)
-                full_ai_text.append(txt)
-                raw_pcm = audio[44:] if len(audio) > 44 else audio
-                ai_audio_chunks.append(raw_pcm)
-
-                await tts_queue.put(audio)
+        if tts_queue is not None:
+            await speak(text_buffer)
 
         ai_text = " ".join(full_ai_text)
         ai_pcm = b"".join(ai_audio_chunks)
@@ -253,6 +252,7 @@ class AstMediaWebSocket:
 
     async def process_media(self, ws_media):
         self.log(logging.INFO, "Media WebSocket stream active.")
+        self.setup_recording()
 
         db_session_id = None
         try:
@@ -269,120 +269,98 @@ class AstMediaWebSocket:
         tts_queue = asyncio.Queue(maxsize=50)     
 
         state = {'status': 'listening'}
+        greeting_text = "Assalomu alaykum, Xalq Bankining Eaay yordamchisi. Sizga qanday yordam bera olaman."
         conversation = [
-            {                    
+            {
                 "role": "system",
                 "content": SYSTEM_PROMPT_SOCIAL
             },
             {
                 "role": "assistant",
-                "content": "Assalomu alaykum, Xalq Bankining Eaay yordamchisi. Sizga qanday yordam bera olaman."
+                "content": greeting_text
             }
         ]
 
         playback_task = asyncio.create_task(tts_playback_worker(tts_queue, ws_media, session, state))
 
+        greeting_audio = await synthesize_tts(greeting_text)
+        await tts_queue.put(greeting_audio)
+
         def resume(): 
             nonlocal state
             state["status"] = "listening"
         
-        # gRPC stream uchun chiquvchi oqim xabarlari navbati
-        vad_send_q = asyncio.Queue()
-
-        async def vad_gen():
-            """gRPC serverga chunklarni uzatib turuvchi generator."""
-            try:
-                while True:
-                    chunk = await vad_send_q.get()
-                    if chunk is None:  # Tugatish signali
-                        break
-                    yield vad_pb2.AudioChunk(audio_data=chunk, sample_rate=16000, theshold=VAD_THRESHOLD)
-                    vad_send_q.task_done()
-            except Exception as e:
-                self.log(logging.ERROR, f"gRPC Generator error: {e}")
+        local_vad = VoiceActivityDetector(threshold=VAD_THRESHOLD)
 
         async def receive_ws_audio():
-            """Asteriskdan audio oqimini real-time (hech qanday bloklanishlarsiz) qabul qiluvchi."""
+            """Asteriskdan audio oqimini real-time qabul qiluvchi va lokal VAD orqali tekshiruvchi."""
+            nonlocal playback_task
             try:
                 async for msg in ws_media:
                     if isinstance(msg, bytes):
                         self.audio_buffer.extend(msg)
-                        
+
                         while len(self.audio_buffer) >= self.target_size:
                             raw_chunk = self.audio_buffer[:self.target_size]
                             self.audio_buffer = self.audio_buffer[self.target_size:]
-                            
+
                             chunk_bytes = bytes(raw_chunk)
 
                             if self.audio_file:
                                 await asyncio.to_thread(self.audio_file.writeframes, chunk_bytes)
-                            
+
                             # 🟢 REAL-TIME BUFFERING: Ovozni darhol deque'ga saqlaymiz. Tarmoq kechikishi ta'sir qilmaydi!
                             session.push_chunk(chunk_bytes)
 
-                            # CPU operatsiyasini thread'ga chiqaramiz
+                            # CPU operatsiyalarini (denoise + Silero VAD) thread'ga chiqaramiz
                             low_vol_chunk = await asyncio.to_thread(lower_volume_np, chunk_bytes, 0.5)
-                            await vad_send_q.put(low_vol_chunk)
-                    
+                            is_voice = await asyncio.to_thread(local_vad.process_frame, low_vol_chunk)
+
+                            if session.update_vad_status(is_voice, state, ws=ws_media):
+                                state['status'] = "processing"
+
+                                session.new_voice_detected.set()
+                                if playback_task:
+                                    playback_task.cancel()
+
+                                while not tts_queue.empty():
+                                    tts_queue.get_nowait()
+
+                                session.new_voice_detected.clear()
+                                playback_task = asyncio.create_task(tts_playback_worker(tts_queue, ws_media, session, state))
+
+                                # Fondagi yig'ilgan to'liq va uzilishlarsiz audioni qayta ishlashga jo'natamiz
+                                asyncio.create_task(process_segment(
+                                    session.reset(), conversation, tts_queue, resume, ws_media,
+                                    db_session_id=db_session_id, turn_index=turn_index,
+                                    session_pcm_chunks=session_pcm_chunks,
+                                    session_id=self.session_id
+                                ))
+
                     elif isinstance(msg, str) and "MEDIA_STOP" in msg:
                         return
             except Exception as e:
                 self.log(logging.ERROR, f"WS Receive Task Error: {e}")
-            finally:
-                # Oqim tugaganda gRPC generatorini ham to'xtatamiz
-                await vad_send_q.put(None)
-
-        # Asterisk audio qabul qiluvchini alohida parallel Task sifatida ishga tushiramiz
-        ws_receive_task = asyncio.create_task(receive_ws_audio())
-
-        async with grpc.aio.insecure_channel(VAD_URL) as channel:
-            stub = vad_pb2_grpc.VoiceActivityDetectorStub(channel)
-            
-            try:
-                # gRPC VAD natijalarini tinglash (Uchinchi liniya qo'shilganda bu kechikishi mumkin, lekin audio yutilmaydi)
-                async for result in stub.DetectVoice(vad_gen()):
-
-                    if session.update_vad_status(result.is_voice, state, ws=ws_media):
-                        state['status'] = "processing"
-                        
-                        session.new_voice_detected.set()
-                        if playback_task: 
-                            playback_task.cancel()
-                        
-                        while not tts_queue.empty(): 
-                            tts_queue.get_nowait()
-                        
-                        session.new_voice_detected.clear()
-                        playback_task = asyncio.create_task(tts_playback_worker(tts_queue, ws_media, session, state))
-
-                        # Fondagi yig'ilgan to'liq va uzilishlarsiz audioni qayta ishlashga jo'natamiz
-                        asyncio.create_task(process_segment(
-                            session.reset(), conversation, tts_queue, resume, ws_media, 
-                            db_session_id=db_session_id, turn_index=turn_index, 
-                            session_pcm_chunks=session_pcm_chunks, 
-                            session_id=self.session_id
-                        ))
-            
-            except Exception as e:
-                self.log(logging.ERROR, f"VAD Loop Error: {e}")
                 traceback.print_exc()
-            finally:
-                ws_receive_task.cancel()
-                if playback_task: 
-                    playback_task.cancel()
-                if self.audio_file: 
-                    await asyncio.to_thread(self.audio_file.close)
-                self.log(logging.INFO, "Media stream closed.")
 
-                if db_session_id:
-                    try:
-                        mixmonitor_path = f"{self.caller_num}-{self.session_id}.wav"
-                        await asyncio.to_thread(
-                            update_session_recordings, session_id=db_session_id, combined_path=mixmonitor_path
-                        )
-                        self.log(logging.INFO, f"MixMonitor audio path saved: {mixmonitor_path}")
-                    except Exception as e:
-                        self.log(logging.ERROR, f"MixMonitor path save error: {e}")
+        try:
+            await receive_ws_audio()
+        finally:
+            if playback_task:
+                playback_task.cancel()
+            if self.audio_file:
+                await asyncio.to_thread(self.audio_file.close)
+            self.log(logging.INFO, "Media stream closed.")
+
+            if db_session_id:
+                try:
+                    mixmonitor_path = f"{self.caller_num}-{self.session_id}.wav"
+                    await asyncio.to_thread(
+                        update_session_recordings, session_id=db_session_id, combined_path=mixmonitor_path
+                    )
+                    self.log(logging.INFO, f"MixMonitor audio path saved: {mixmonitor_path}")
+                except Exception as e:
+                    self.log(logging.ERROR, f"MixMonitor path save error: {e}")
 
 
 class AstMediaWebSocketClient(AstMediaWebSocket):
