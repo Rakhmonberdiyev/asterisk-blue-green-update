@@ -158,10 +158,15 @@ async def process_segment(audio_bytes, conversation, tts_queue, resume_callback,
             create_conversation, role="assistant", message=ai_text, speech_path=ai_wav_path, session_id=db_session_id
         )
 
+    except asyncio.CancelledError:
+        # Barge-in superseded this turn — a new segment task already owns
+        # playback/state, so don't let this one's cleanup clobber it.
+        raise
     except Exception as e:
         print(f"Pipeline error: {e}")
         traceback.print_exc()
-    finally:
+        resume_callback()
+    else:
         resume_callback()
 
 
@@ -282,19 +287,20 @@ class AstMediaWebSocket:
         ]
 
         playback_task = asyncio.create_task(tts_playback_worker(tts_queue, ws_media, session, state))
+        segment_task = None
 
         greeting_audio = await synthesize_tts(greeting_text)
         await tts_queue.put(greeting_audio)
 
-        def resume(): 
+        def resume():
             nonlocal state
             state["status"] = "listening"
-        
+
         local_vad = VoiceActivityDetector(threshold=VAD_THRESHOLD)
 
         async def receive_ws_audio():
             """Asteriskdan audio oqimini real-time qabul qiluvchi va lokal VAD orqali tekshiruvchi."""
-            nonlocal playback_task
+            nonlocal playback_task, segment_task
             try:
                 async for msg in ws_media:
                     if isinstance(msg, bytes):
@@ -323,6 +329,14 @@ class AstMediaWebSocket:
                                 if playback_task:
                                     playback_task.cancel()
 
+                                # Barge-in: the previous turn's STT/LLM/TTS pipeline is still
+                                # running in the background and would otherwise keep pushing
+                                # stale audio into tts_queue and mutating `conversation`
+                                # concurrently with the new turn — cancel it so only one
+                                # turn is ever in flight.
+                                if segment_task and not segment_task.done():
+                                    segment_task.cancel()
+
                                 while not tts_queue.empty():
                                     tts_queue.get_nowait()
 
@@ -330,7 +344,7 @@ class AstMediaWebSocket:
                                 playback_task = asyncio.create_task(tts_playback_worker(tts_queue, ws_media, session, state))
 
                                 # Fondagi yig'ilgan to'liq va uzilishlarsiz audioni qayta ishlashga jo'natamiz
-                                asyncio.create_task(process_segment(
+                                segment_task = asyncio.create_task(process_segment(
                                     session.reset(), conversation, tts_queue, resume, ws_media,
                                     db_session_id=db_session_id, turn_index=turn_index,
                                     session_pcm_chunks=session_pcm_chunks,
@@ -348,6 +362,8 @@ class AstMediaWebSocket:
         finally:
             if playback_task:
                 playback_task.cancel()
+            if segment_task and not segment_task.done():
+                segment_task.cancel()
             if self.audio_file:
                 await asyncio.to_thread(self.audio_file.close)
             self.log(logging.INFO, "Media stream closed.")
